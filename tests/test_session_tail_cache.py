@@ -544,6 +544,73 @@ def _backup_warning_records(caplog, session_id):
     ]
 
 
+
+@pytest.mark.parametrize(
+    "corrupt_bytes",
+    [
+        b'{"messages":',
+        b"\xff",
+        b"[]",
+        b'{"messages": "not-an-array"}',
+        b'{"messages": {"unexpected": "object"}}',
+    ],
+    ids=[
+        "truncated-json",
+        "invalid-utf8",
+        "non-object-json",
+        "string-messages",
+        "object-messages",
+    ],
+)
+def test_save_recovers_from_corrupt_existing_sidecar_without_backup(
+    isolated_session_store, corrupt_bytes
+):
+    session = Session(
+        session_id="recover_corrupt_sidecar",
+        messages=[_message(index) for index in range(2)],
+    )
+    session.save(touch_updated_at=False, skip_index=True)
+    cache_path = models.session_tail_cache_path(session.session_id)
+    assert cache_path.exists()
+
+    session.path.write_bytes(corrupt_bytes)
+    session.messages = [_message(index) for index in range(3)]
+
+    session.save(touch_updated_at=False, skip_index=True)
+
+    authoritative = json.loads(session.path.read_bytes())
+    assert authoritative["messages"] == session.messages
+    assert not session.path.with_suffix(".json.bak").exists()
+    assert models.read_session_tail_cache(session.session_id) is not None
+
+    # Recovery replaces the unparseable source once; a subsequent save remains
+    # on the normal authoritative path instead of inheriting the old failure.
+    session.save(touch_updated_at=False, skip_index=True)
+    assert json.loads(session.path.read_bytes())["messages"] == session.messages
+
+
+
+@pytest.mark.parametrize(
+    "corrupt_bytes",
+    [b'{"messages": "not-an-array"}', b'{"messages": {"unexpected": "object"}}'],
+    ids=["string-messages", "object-messages"],
+)
+def test_active_save_recovers_from_structurally_corrupt_messages(
+    isolated_session_store, corrupt_bytes
+):
+    session = Session(
+        session_id="recover_active_corrupt_sidecar",
+        messages=[],
+        active_stream_id="stream_1",
+    )
+    session.path.write_bytes(corrupt_bytes)
+
+    session.save(touch_updated_at=False, skip_index=True)
+
+    assert json.loads(session.path.read_bytes())["messages"] == []
+    assert not session.path.with_suffix(".json.bak").exists()
+
+
 def test_shrink_save_survives_backup_publication_oserror(
     isolated_session_store, monkeypatch, caplog
 ):
@@ -1462,6 +1529,37 @@ def test_parent_rename_and_replacement_after_binding_fails_closed(tmp_path, monk
 
     assert not (moved_store / "parent_replaced.json").exists()
     assert not (store / "parent_replaced.json").exists()
+
+
+
+def test_parent_replacement_during_enter_closes_parent_fd(tmp_path, monkeypatch):
+    if os.name == "nt":
+        pytest.skip("POSIX descriptor closure probe")
+
+    store = tmp_path / "sessions"
+    moved_store = tmp_path / "sessions-moved"
+    store.mkdir()
+    target = models._BoundSessionSidecarTarget(store / "parent_fd_cleanup.json")
+    store.rename(moved_store)
+    store.mkdir()
+
+    opened = []
+    original_open = models.os.open
+
+    def record_open(*args, **kwargs):
+        fd = original_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    monkeypatch.setattr(models.os, "open", record_open)
+
+    with pytest.raises(OSError, match="session sidecar parent changed"):
+        target.__enter__()
+
+    assert target._parent_fd is None
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
 
 
 def test_final_symlink_swap_after_binding_fails_closed(tmp_path, monkeypatch):

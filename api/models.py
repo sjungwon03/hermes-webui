@@ -276,37 +276,55 @@ class _BoundSessionSidecarTarget:
     def sid(self) -> str:
         return self.name[:-5] if self.name.endswith('.json') else ''
 
+    def _close_open_handles(self) -> None:
+        """Close any partially acquired binding resources without masking the cause."""
+        cache_fd, self._cache_fd = self._cache_fd, None
+        parent_fd, self._parent_fd = self._parent_fd, None
+        windows_cache_handles, self._windows_cache_handles = self._windows_cache_handles, []
+        windows_parent_handle, self._windows_parent_handle = self._windows_parent_handle, None
+        for fd in (cache_fd, parent_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        for handle in reversed(windows_cache_handles):
+            try:
+                _close_windows_handle(handle)
+            except OSError:
+                pass
+        if windows_parent_handle is not None:
+            try:
+                _close_windows_handle(windows_parent_handle)
+            except OSError:
+                pass
+
     def __enter__(self):
-        if os.name == 'nt':  # pragma: no cover - exercised by the native-Windows gate.
-            self._windows_parent_handle = _open_windows_directory_handle(self.parent)
-        else:
-            flags = os.O_RDONLY
-            flags |= getattr(os, 'O_DIRECTORY', 0)
-            flags |= getattr(os, 'O_CLOEXEC', 0)
-            flags |= getattr(os, 'O_NOFOLLOW', 0)
-            self._parent_fd = os.open(self.parent, flags)
-        self._parent_stat = (
-            os.fstat(self._parent_fd)
-            if self._parent_fd is not None
-            else os.stat(self.parent, follow_symlinks=False)
-        )
-        if _filesystem_object_identity(self._parent_stat) != self._requested_identity:
-            raise OSError('session sidecar parent changed during target binding')
-        return self
+        try:
+            if os.name == 'nt':  # pragma: no cover - exercised by the native-Windows gate.
+                self._windows_parent_handle = _open_windows_directory_handle(self.parent)
+            else:
+                flags = os.O_RDONLY
+                flags |= getattr(os, 'O_DIRECTORY', 0)
+                flags |= getattr(os, 'O_CLOEXEC', 0)
+                flags |= getattr(os, 'O_NOFOLLOW', 0)
+                self._parent_fd = os.open(self.parent, flags)
+            self._parent_stat = (
+                os.fstat(self._parent_fd)
+                if self._parent_fd is not None
+                else os.stat(self.parent, follow_symlinks=False)
+            )
+            if _filesystem_object_identity(self._parent_stat) != self._requested_identity:
+                raise OSError('session sidecar parent changed during target binding')
+            return self
+        except BaseException:
+            # __exit__ is not called when __enter__ raises, so this adversarial
+            # parent-replacement path must release its own descriptor/handle.
+            self._close_open_handles()
+            raise
 
     def __exit__(self, _exc_type, _exc, _tb):
-        if self._cache_fd is not None:
-            os.close(self._cache_fd)
-            self._cache_fd = None
-        if self._parent_fd is not None:
-            os.close(self._parent_fd)
-            self._parent_fd = None
-        for handle in reversed(self._windows_cache_handles):
-            _close_windows_handle(handle)
-        self._windows_cache_handles.clear()
-        if self._windows_parent_handle is not None:
-            _close_windows_handle(self._windows_parent_handle)
-            self._windows_parent_handle = None
+        self._close_open_handles()
 
     def validate_binding(self) -> None:
         try:
@@ -1938,11 +1956,22 @@ class Session:
                     if existing_bytes is None:
                         raise ValueError('missing authoritative source bytes')
                     existing = json.loads(existing_bytes)
-                    existing_msg_count = len(existing.get('messages') or [])
-                except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError) as exc:
-                    raise OSError(
-                        'cannot prove previous authoritative session message count'
-                    ) from exc
+                    if not isinstance(existing, dict):
+                        raise ValueError('authoritative source is not an object')
+                    existing_messages = existing.get('messages')
+                    if existing_messages is not None and not isinstance(existing_messages, list):
+                        raise ValueError('authoritative source messages is not a list')
+                    existing_msg_count = len(existing_messages or [])
+                except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError, AttributeError):
+                    # A stable but malformed prior sidecar cannot supply a safe
+                    # recovery backup. Preserve the valid in-memory snapshot as
+                    # the new authority instead of permanently denying every
+                    # future save on these corrupt bytes.
+                    logger.warning(
+                        "session %s replacing corrupt previous sidecar without backup",
+                        self.session_id,
+                    )
+                    existing_msg_count = 0
             if (
                 existing_msg_count > 0
                 and incoming_msg_count == 0
